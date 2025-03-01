@@ -1,0 +1,5 @@
+ultralytics
+numpy
+matplotlib
+smtp
+seaborn
