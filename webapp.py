@@ -10,11 +10,14 @@ import seaborn as sns
 from ultralytics import YOLO
 from sort import Sort
 import requests
+import smtplib
+from email.message import EmailMessage
+import ssl
 
-# Page Config
 st.set_page_config(page_title="Construction Safety Dashboard", page_icon="🚧", layout="wide")
+
 DEFAULT_IMAGE_URL = "https://cdn-icons-png.flaticon.com/512/9131/9131478.png"
-# Paths
+
 webcam_csv_file = 'webcam_ppe_tracking.csv'
 video_csv_file = 'video_ppe_tracking.csv'
 
@@ -22,37 +25,71 @@ for file in [webcam_csv_file, video_csv_file]:
     if not os.path.exists(file):
         pd.DataFrame(columns=["Timestamp", "Person ID", "Equipment Worn", "Equipment Not Worn"]).to_csv(file, index=False)
 
-# Session state initialization
 if "receiver_email" not in st.session_state:
-    st.session_state.receiver_email = "example@example.com"
+    st.session_state.receiver_email = "mammarali299@gmail.com"
 
 if "profile_image" not in st.session_state:
-    # Check if the image already exists locally, if not, download it
     if not os.path.exists("default_profile.jpg"):
         response = requests.get(DEFAULT_IMAGE_URL)
         with open("default_profile.jpg", "wb") as f:
             f.write(response.content)
-
     st.session_state.profile_image = "default_profile.jpg"
 
-if "stop_webcam" not in st.session_state:
-    st.session_state.stop_webcam = False
+if "webcam_active" not in st.session_state:
+    st.session_state.webcam_active = False
 
-def load_model():
-    """ Lazy load the YOLO model. Only load when needed. """
-    if "yolo_model" not in st.session_state:
-        st.session_state.yolo_model = YOLO('ppe.pt')
-        st.session_state.tracker = Sort()
+if "session_data" not in st.session_state:
+    st.session_state.session_data = {}
 
-def process_frame(frame, csv_file):
-    """ YOLO inference and tracking, returns processed frame and detected classes """
-    load_model()
+if "yolo_model" not in st.session_state:
+    st.session_state.yolo_model = YOLO('ppe.pt')
+    st.session_state.tracker = Sort()
+
+def send_email_with_attachment(receiver_email, csv_file, image_file):
+    sender_email = "mammarali299@gmail.com"
+    sender_password = "fwouqdkyedxulbol"  # Use App Password if using Gmail
+
+    subject = "Safety Monitoring Report"
+    body = "Please find attached the safety report and violation snapshot."
+
+    msg = EmailMessage()
+    msg["From"] = sender_email
+    msg["To"] = receiver_email
+    msg["Subject"] = subject
+    msg.set_content(body)
+
+    with open(csv_file, "rb") as f:
+        msg.add_attachment(f.read(), maintype="application", subtype="csv", filename=os.path.basename(csv_file))
+
+    with open(image_file, "rb") as f:
+        msg.add_attachment(f.read(), maintype="image", subtype="jpeg", filename=os.path.basename(image_file))
+
+    context = ssl.create_default_context()
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as server:
+        server.login(sender_email, sender_password)
+        server.send_message(msg)
+
+    print(f"Email sent to {receiver_email}")
+
+def save_session_data(csv_file):
+    if not st.session_state.session_data:
+        return
+    if not os.path.exists(csv_file):
+        pd.DataFrame(columns=["Timestamp", "Person ID", "Equipment Worn", "Equipment Not Worn"]).to_csv(csv_file, index=False)
+
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    with open(csv_file, 'a', newline='') as file:
+        for obj_id, equipment in st.session_state.session_data.items():
+            worn = ' '.join(equipment['worn']) or "None"
+            not_worn = ' '.join(equipment['not_worn']) or "None"
+            file.write(f"{timestamp},{obj_id},{worn},{not_worn}\n")
+
+def process_frame(frame):
     model = st.session_state.yolo_model
     tracker = st.session_state.tracker
 
     results = model(frame)
     detections = []
-    person_equipment = {}
 
     for result in results:
         for box in result.boxes:
@@ -66,7 +103,9 @@ def process_frame(frame, csv_file):
 
     for obj in tracked_objects:
         x1, y1, x2, y2, obj_id = map(int, obj)
-        person_equipment[obj_id] = {"worn": [], "not_worn": []}
+
+        if obj_id not in st.session_state.session_data:
+            st.session_state.session_data[obj_id] = {"worn": set(), "not_worn": set()}
 
         for result in results:
             for box in result.boxes:
@@ -77,193 +116,174 @@ def process_frame(frame, csv_file):
                 if conf >= 0.4 and label != "Person":
                     if x1 <= bx1 <= x2 and y1 <= by1 <= y2:
                         if label.startswith("NO-"):
-                            person_equipment[obj_id]["not_worn"].append(label)
+                            st.session_state.session_data[obj_id]["not_worn"].add(label)
                         else:
-                            person_equipment[obj_id]["worn"].append(label)
+                            st.session_state.session_data[obj_id]["worn"].add(label)
 
                     color = (0, 255, 0) if "NO-" not in label else (255, 0, 0)
                     cv2.rectangle(frame, (int(bx1), int(by1)), (int(bx2), int(by2)), color, 2)
                     cv2.putText(frame, label, (int(bx1), int(by1) - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-        with open(csv_file, 'a', newline='') as file:
-            worn = ', '.join(person_equipment[obj_id]['worn']) or "None"
-            not_worn = ', '.join(person_equipment[obj_id]['not_worn']) or "None"
-            file.write(f"{timestamp},{obj_id},{worn},{not_worn}\n")
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
+        cv2.putText(frame, f"ID: {obj_id}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-    return frame, person_equipment
+    st.session_state.last_frame = frame
+    return frame
 
-
-EXPECTED_COLUMNS = ["Timestamp", "Person ID", "Equipment Worn", "Equipment Not Worn"]
-
-def initialize_csv(file_path):
-    """Ensure the CSV exists and has correct columns."""
-    if not os.path.exists(file_path):
-        st.warning(f"{file_path} not found, initializing new file.")
-        pd.DataFrame(columns=EXPECTED_COLUMNS).to_csv(file_path, index=False)
-        return
-
-    # Validate the header and reset if corrupted
-    try:
-        df = pd.read_csv(file_path, nrows=1)
-        if list(df.columns) != EXPECTED_COLUMNS:
-            raise ValueError(f"{file_path} columns are incorrect.")
-    except Exception:
-        st.warning(f"{file_path} is corrupted or has incorrect format. Resetting file.")
-        pd.DataFrame(columns=EXPECTED_COLUMNS).to_csv(file_path, index=False)
-
-def load_and_validate_csv(file_path):
-    """Load CSV with error handling; initialize if necessary."""
-    initialize_csv(file_path)
-    try:
-        return pd.read_csv(file_path, on_bad_lines="skip")
-    except Exception as e:
-        st.error(f"Failed to read {file_path}: {e}")
-        return pd.DataFrame(columns=EXPECTED_COLUMNS)
-
-def plot_class_distribution(df, title):
-    """ Helper function to plot class distribution from a DataFrame """
-    if df.empty:
-        st.warning(f"No data available for {title}. Please process some videos first.")
-        return
-
-    all_classes = []
-
-    # Ensure missing values are replaced with empty strings before splitting
-    df = df.fillna("")  # Convert NaN values to empty strings
-
-    for worn, not_worn in zip(df["Equipment Worn"], df["Equipment Not Worn"]):
-        all_classes.extend(str(worn).split(", "))  # Convert to string before splitting
-        all_classes.extend(str(not_worn).split(", "))
-
-    # Only keep non-empty class names
-    all_classes = [cls.strip() for cls in all_classes if cls.strip()]
-
-    if not all_classes:
-        st.warning(f"No valid class data found for {title}.")
-        return
-
-    # Generate Class Distribution Plot
-    class_counts = pd.Series(all_classes).value_counts()
-
-    fig, ax = plt.subplots()
-    sns.barplot(x=class_counts.index, y=class_counts.values, ax=ax)
-    ax.set_title(f"{title} - Class Distribution")
-    plt.xticks(rotation=45)
-    st.pyplot(fig)
-
-
-# Sidebar Navigation
 with st.sidebar:
     st.image(st.session_state.profile_image, width=100)
-    page = st.radio(f"Welcome!", ["Dashboard", "Set Receiver Email", "Analytics", "About Me"])
+    page = st.radio("Welcome!", ["Dashboard", "Set Receiver Email", "Analytics", "About Me"])
 
-# Dashboard
 if page == "Dashboard":
     st.title("🚧 Construction Safety Dashboard")
-    tab1, tab2 = st.tabs(["📹 Webcam Detection", "📼 Upload Video"])
 
-    # Webcam
-    with tab1:
-        if st.button("Start Webcam"):
-            st.session_state.stop_webcam = False
+    if st.button("Start Webcam"):
+        st.session_state.webcam_active = True
+        st.session_state.session_data = {}
 
-        if st.button("Stop Webcam"):
-            st.session_state.stop_webcam = True
+    if st.button("Stop Webcam"):
+        st.session_state.webcam_active = False
+        save_session_data(webcam_csv_file)
 
-        detected_classes = set()
-        if not st.session_state.stop_webcam:
-            cap = cv2.VideoCapture(0)
-            placeholder = st.empty()
+        if "last_frame" in st.session_state:
+            evidence_image = "violation_snapshot.jpg"
+            cv2.imwrite(evidence_image, st.session_state.last_frame)
+            send_email_with_attachment(st.session_state.receiver_email, webcam_csv_file, evidence_image)
 
-            while cap.isOpened() and not st.session_state.stop_webcam:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                frame, equipment = process_frame(frame, webcam_csv_file)
-                for eq in equipment.values():
-                    detected_classes.update(eq['worn'] + eq['not_worn'])
-                placeholder.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), channels="RGB")
+    if st.session_state.webcam_active:
+        cap = cv2.VideoCapture(0)
+        placeholder = st.empty()
 
-            cap.release()
+        while cap.isOpened() and st.session_state.webcam_active:
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-        st.write("### Detected Classes")
-        st.write(detected_classes)
+            frame = process_frame(frame)
+            placeholder.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), channels="RGB")
 
-    # Video
-    with tab2:
-        uploaded_file = st.file_uploader("Upload Video", type=["mp4", "avi"])
+        cap.release()
 
-        if uploaded_file:
-            temp_fd, temp_path = tempfile.mkstemp(suffix=".mp4")
-            with open(temp_path, "wb") as f:
-                f.write(uploaded_file.read())
+    st.write("### Detected Classes")
+    detected_classes = set()
+    for equipment in st.session_state.session_data.values():
+        detected_classes.update(equipment['worn'])
+        detected_classes.update(equipment['not_worn'])
+    st.write(detected_classes)
 
-            cap = cv2.VideoCapture(temp_path)
-            st.info("Processing video...")
-            progress_bar = st.progress(0)
-
-            detected_classes = set()
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-            for i in range(total_frames):
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                frame, equipment = process_frame(frame, video_csv_file)
-                for eq in equipment.values():
-                    detected_classes.update(eq['worn'] + eq['not_worn'])
-                progress_bar.progress((i+1) / total_frames)
-
-            cap.release()
-            os.close(temp_fd)
-            os.remove(temp_path)
-
-            st.success("Processing Complete")
-            st.write("### Detected Classes")
-            st.write(detected_classes)
-
-# Receiver Email
 elif page == "Set Receiver Email":
+    st.title("📧 Set Receiver Email")
     email = st.text_input("Receiver Email", st.session_state.receiver_email)
     if st.button("Save"):
         st.session_state.receiver_email = email
-        st.success("Receiver Email Updated!")
+        st.success("Receiver email updated!")
 
-# Analytics
 elif page == "Analytics":
     st.title("📊 Safety Analytics")
 
-    tab1, tab2 = st.tabs(["📹 Webcam Data", "📼 Uploaded Video Data"])
+    data_source = st.radio("Select Data Source", ["📹 Webcam Data", "📼 Uploaded Video Data"])
 
-    # Webcam Data Tab
-    with tab1:
-        df_webcam = load_and_validate_csv(webcam_csv_file)
-        if df_webcam.empty:
-            st.warning("No webcam data found. Run the webcam detection first.")
-        else:
-            plot_class_distribution(df_webcam, "Webcam")
-            st.write("### Raw Data")
-            st.dataframe(df_webcam)
+    file = webcam_csv_file if data_source == "📹 Webcam Data" else video_csv_file
+    label = data_source
 
-    # Uploaded Video Data Tab
-    with tab2:
-        df_video = load_and_validate_csv(video_csv_file)
-        if df_video.empty:
-            st.warning("No uploaded video data found. Process a video first.")
-        else:
-            plot_class_distribution(df_video, "Uploaded Video")
-            st.write("### Raw Data")
-            st.dataframe(df_video)
-# About Me
+    if os.path.exists(file):
+        df = pd.read_csv(file)
+        df["Person ID"] = df["Person ID"].astype(str)  # Ensure IDs are strings for consistency
+
+        # Function to plot violations using Seaborn
+        def plot_violations_by_person(df, title):
+            if df.empty:
+                st.warning(f"No data available for {title}.")
+                return
+
+            # Initialize violation tracker
+            violation_summary = {}
+
+            # Loop through each row to gather violations for each person
+            for index, row in df.iterrows():
+                person_id = row["Person ID"]
+                not_worn_list = str(row["Equipment Not Worn"]).split()
+
+                if person_id not in violation_summary:
+                    violation_summary[person_id] = {"NO-Hardhat": 0, "NO-Mask": 0, "NO-Safety Vest": 0}
+
+                for item in not_worn_list:
+                    item = item.strip()
+                    if item in violation_summary[person_id]:
+                        violation_summary[person_id][item] += 1
+
+            # Convert to DataFrame
+            violation_df = pd.DataFrame.from_dict(violation_summary, orient="index").reset_index()
+            violation_df = violation_df.rename(columns={"index": "Person ID"})
+            violation_df = violation_df.fillna(0)
+
+            # Convert to long format for Seaborn plotting
+            long_df = violation_df.melt(id_vars=["Person ID"], var_name="Violation Type", value_name="Count")
+
+            st.write(f"### {title} - Violations by Person ID")
+
+            # Plot using Seaborn
+            sns.set(style="whitegrid")
+            fig, ax = plt.subplots(figsize=(12, 6))
+            sns.barplot(
+                x="Person ID", y="Count", hue="Violation Type", data=long_df, ax=ax, palette="Reds"
+            )
+            ax.set_title(f"{title} - Equipment Not Worn by Person ID")
+            ax.set_xlabel("Person ID")
+            ax.set_ylabel("Violation Count")
+            plt.xticks(rotation=45)
+            st.pyplot(fig)
+
+        # Function to calculate and display Safety Check Summary
+        def plot_safety_check_summary(df, title):
+            if df.empty:
+                st.warning(f"No data available for {title}.")
+                return
+
+            safety_check = {}
+
+            for index, row in df.iterrows():
+                person_id = row["Person ID"]
+                not_worn_list = str(row["Equipment Not Worn"]).split()
+
+                if person_id not in safety_check:
+                    safety_check[person_id] = "✅ Pass"
+
+                for item in not_worn_list:
+                    if item.startswith("NO-"):
+                        safety_check[person_id] = "❌ Fail"
+                        break  # One violation is enough to fail
+
+            # Convert safety check summary to DataFrame
+            safety_df = pd.DataFrame(list(safety_check.items()), columns=["Person ID", "Safety Check"])
+
+            st.write(f"### {title} - Safety Check Summary")
+            st.dataframe(safety_df)
+
+            # Plotting Pass/Fail counts
+            summary_count = safety_df["Safety Check"].value_counts()
+
+            st.write(f"### {title} - Pass/Fail Summary")
+            fig, ax = plt.subplots()
+            sns.barplot(x=summary_count.index, y=summary_count.values, ax=ax, palette=["#4caf50", "#f44336"])
+            ax.set_ylabel("Count")
+            ax.set_title(f"{title} - Safety Check Result")
+            st.pyplot(fig)
+
+        # Show Violations Chart and Safety Check Summary
+        plot_violations_by_person(df, label)
+        plot_safety_check_summary(df, label)
+
+        # Show raw data
+        st.write(f"### {label} - Raw Data")
+        st.dataframe(df)
+
+    else:
+        st.warning(f"No data found for {label}. Please run detection first.")
+
+
 elif page == "About Me":
-    name = st.text_input("Name", "John Doe")
-    gender = st.selectbox("Gender", ["Male", "Female", "Other"])
-    profile_image = st.file_uploader("Upload Profile Image")
-
-    if profile_image:
-        with open("profile.png", "wb") as f:
-            f.write(profile_image.read())
-        st.session_state.profile_image = "profile.png"
-
+    st.text_input("Name", "John Doe")
+    st.selectbox("Gender", ["Male", "Female", "Other"])
+    st.file_uploader("Upload Profile Image")
     st.image(st.session_state.profile_image, width=150)
